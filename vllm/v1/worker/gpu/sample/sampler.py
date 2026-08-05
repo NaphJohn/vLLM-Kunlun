@@ -232,13 +232,36 @@ class Sampler:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-            sampled = gumbel_sample(
-                processed_logits,
-                expanded_idx_mapping,
-                self.sampling_states.temperature.gpu,
-                self.sampling_states.seeds.gpu,
-                pos,
-                apply_temperature=False,
-                use_fp64=self.use_fp64_gumbel,
-            )
+            if _kg_greedy_fastpath(self.sampling_states, idx_mapping_np):
+                # temp=0 all-greedy: argmax over processed_logits is exactly the
+                # greedy branch of _gumbel_sample_native, without the full setup
+                # + [T,V] boolean-mask gather. Host-side check => no D2H sync.
+                sampled = processed_logits.argmax(dim=-1).to(torch.int64)
+            else:
+                sampled = gumbel_sample(
+                    processed_logits,
+                    expanded_idx_mapping,
+                    self.sampling_states.temperature.gpu,
+                    self.sampling_states.seeds.gpu,
+                    pos,
+                    apply_temperature=False,
+                    use_fp64=self.use_fp64_gumbel,
+                )
         return sampled, processed_logits
+
+
+# === KUNLUN_GUMBEL_GREEDY_PATCH ===
+import os as _kg_os  # noqa: E402
+import numpy as _kg_np  # noqa: E402
+
+
+def _kg_greedy_fastpath(sampling_states, idx_mapping_np):
+    # Fire only when the ENTIRE batch is greedy (temperature == 0). Mixed
+    # greedy/random batches fall back to gumbel_sample (per-row handling).
+    if _kg_os.environ.get("KUNLUN_GUMBEL_GREEDY", "1") == "0":
+        return False
+    try:
+        temps = sampling_states.temperature.np[idx_mapping_np]
+        return bool(_kg_np.all(temps == 0.0))
+    except Exception:
+        return False

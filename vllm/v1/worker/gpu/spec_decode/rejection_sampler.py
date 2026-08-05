@@ -158,3 +158,42 @@ class RejectionSampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
         )
+
+
+# === KUNLUN_NATIVE_P1_PATCH ===
+
+from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as _kl_rsu  # noqa: E402
+# KUNLUN_REJ_XPU_GATE
+import os as _kl_os  # noqa: E402
+# Default-on: route all-greedy batches to the fused kunlun_ops rejection
+# greedy sampler (proven byte-identical to the native python loop); it
+# self-falls-back to rejection_sample_native for non-greedy/block/synthetic.
+# Escape hatch: KUNLUN_REJ_XPU=0 restores the pure native path.
+if _kl_os.environ.get("KUNLUN_REJ_XPU", "1") != "0":
+    rejection_sample = _kl_rsu.rejection_sample_xpu
+else:
+    rejection_sample = _kl_rsu.rejection_sample_native
+
+
+class _KlKernelShim:
+    def __init__(self, fn):
+        self.fn = fn
+    def __getitem__(self, grid):
+        def run(*args, **kwargs):
+            return self.fn(grid, *args)
+        return run
+
+
+def _flatten_sampled_native(grid, flat_sampled, sampled, sampled_stride, num_sampled, cu_num_logits):
+    num_reqs = grid[0]
+    cu = cu_num_logits.tolist()
+    ns = num_sampled.tolist()
+    for r in range(num_reqs):
+        start = int(cu[r])
+        n = int(ns[r])
+        if n > 0:
+            flat_sampled[start:start + n] = sampled[r, :n]
+
+
+_flatten_sampled_kernel = _KlKernelShim(_flatten_sampled_native)
+

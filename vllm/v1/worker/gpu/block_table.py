@@ -299,3 +299,97 @@ def _compute_slot_mappings_kernel(
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+# === KUNLUN_NATIVE_BLOCKTABLE_PATCH ===
+def _gather_block_tables_native(self, idx_mapping, num_reqs_padded):
+    num_reqs = idx_mapping.shape[0]
+    idxl = idx_mapping.to(torch.long)
+    num_blocks_gpu = self.num_blocks.gpu            # [num_groups, max_num_reqs]
+    for g in range(self.num_kv_cache_groups):
+        src = self.block_tables[g].gpu              # [max_num_reqs, max_num_blocks]
+        dst = self.input_block_tables[g]
+        nb = num_blocks_gpu[g]
+        for b in range(num_reqs):
+            rsi = int(idxl[b])
+            k = int(nb[rsi])
+            if k > 0:
+                dst[b, :k] = src[rsi, :k]
+        if num_reqs_padded > num_reqs:              # zero padded rows (CUDA graphs)
+            dst[num_reqs:num_reqs_padded] = 0
+    return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
+
+
+def _compute_slot_mappings_native(self, idx_mapping, query_start_loc, positions,
+                                  num_tokens_padded):
+    assert self.cp_size == 1, "native slot-mapping only supports CP_SIZE==1"
+    num_reqs = idx_mapping.shape[0]
+    qsl = query_start_loc
+    idxl = idx_mapping.to(torch.long)
+    max_num_tokens = self.max_num_batched_tokens
+    total = int(qsl[num_reqs])
+    for g in range(self.num_kv_cache_groups):
+        bs = int(self.block_sizes_tensor[g])
+        bt = self.block_tables[g].gpu
+        slot = self.slot_mappings[g]
+        for b in range(num_reqs):
+            rsi = int(idxl[b])
+            s = int(qsl[b])
+            e = int(qsl[b + 1])
+            if e > s:
+                pos = positions[s:e].to(torch.long)
+                bidx = pos // bs
+                boff = pos % bs
+                bnum = bt[rsi, bidx].to(torch.long)
+                slot[s:e] = (bnum * bs + boff).to(slot.dtype)
+        if max_num_tokens > total:                  # pad tail to PAD_SLOT_ID
+            slot[total:max_num_tokens] = PAD_SLOT_ID
+    return self.slot_mappings[:, :num_tokens_padded]
+
+
+BlockTables.gather_block_tables = _gather_block_tables_native
+BlockTables.compute_slot_mappings = _compute_slot_mappings_native
+# === KUNLUN_V2_HOSTVEC_PATCH ===
+import os as _hv_os  # noqa: E402
+import torch as _hv_t  # noqa: E402
+def _gather_block_tables_vec(self, idx_mapping, num_reqs_padded):
+    num_reqs = idx_mapping.shape[0]
+    idxl = idx_mapping.to(_hv_t.long)
+    for g in range(self.num_kv_cache_groups):
+        src = self.block_tables[g].gpu
+        dst = self.input_block_tables[g]
+        if num_reqs > 0:
+            dst[:num_reqs] = src[idxl]
+        if num_reqs_padded > num_reqs:
+            dst[num_reqs:num_reqs_padded] = 0
+    return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
+
+def _compute_slot_mappings_vec(self, idx_mapping, query_start_loc, positions, num_tokens_padded):
+    assert self.cp_size == 1, "native slot-mapping only supports CP_SIZE==1"
+    num_reqs = idx_mapping.shape[0]
+    qsl = query_start_loc
+    idxl = idx_mapping.to(_hv_t.long)
+    max_num_tokens = self.max_num_batched_tokens
+    total = int(qsl[num_reqs])
+    token_rsi = None
+    if num_reqs > 0 and total > 0:
+        qlens = (qsl[1:num_reqs + 1] - qsl[:num_reqs]).to(_hv_t.long)
+        token_rsi = _hv_t.repeat_interleave(idxl, qlens)
+    for g in range(self.num_kv_cache_groups):
+        bs = int(self.block_sizes_tensor[g])
+        bt = self.block_tables[g].gpu
+        slot = self.slot_mappings[g]
+        if token_rsi is not None:
+            pos = positions[:total].to(_hv_t.long)
+            bnum = bt[token_rsi, pos // bs].to(_hv_t.long)
+            slot[:total] = (bnum * bs + (pos % bs)).to(slot.dtype)
+        if max_num_tokens > total:
+            slot[total:max_num_tokens] = PAD_SLOT_ID
+    return self.slot_mappings[:, :num_tokens_padded]
+
+if _hv_os.environ.get("KUNLUN_HOSTVEC", "1") != "0":
+    if _hv_os.environ.get("KUNLUN_HOSTVEC_GATHER", "1") != "0":
+        BlockTables.gather_block_tables = _gather_block_tables_vec
+    if _hv_os.environ.get("KUNLUN_HOSTVEC_SLOT", "1") != "0":
+        BlockTables.compute_slot_mappings = _compute_slot_mappings_vec
+
